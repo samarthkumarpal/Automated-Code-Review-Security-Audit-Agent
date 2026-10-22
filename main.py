@@ -137,7 +137,9 @@ def review_with_gemini(
     code: str,
     static_findings: list[dict],
 ) -> ReviewResponse:
-    """Review code with Gemini and validate its structured response."""
+    """Review code with Gemini, retry transient failures, and validate JSON."""
+
+    import time
 
     api_key = os.getenv("GEMINI_API_KEY")
 
@@ -147,7 +149,16 @@ def review_with_gemini(
             detail="GEMINI_API_KEY is not configured",
         )
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    fallback_model = os.getenv(
+        "GEMINI_FALLBACK_MODEL",
+        "gemini-3.5-flash-lite",
+    )
+
+    models = [primary_model]
+    if fallback_model != primary_model:
+        models.append(fallback_model)
+
     schema = ReviewResponse.model_json_schema()
 
     prompt = f"""
@@ -186,42 +197,65 @@ Code to review:
 </untrusted_code>
 """
 
-    try:
-        client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key)
+    last_error = None
 
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0,
-            ),
-        )
+    for model in models:
+        for attempt in range(3):
+            try:
+                logger.info(
+                    "Gemini review attempt %s/3 using model %s",
+                    attempt + 1,
+                    model,
+                )
 
-        if not response.text:
-            raise ValueError("Gemini returned an empty response")
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0,
+                    ),
+                )
 
-        result = ReviewResponse.model_validate_json(response.text)
-        result.static_analysis = static_findings
+                if not response.text:
+                    raise ValueError("Gemini returned an empty response")
 
-        logger.info(
-            "Review completed successfully using model %s",
+                result = ReviewResponse.model_validate_json(response.text)
+                result.static_analysis = static_findings
+
+                logger.info(
+                    "Review completed successfully using model %s",
+                    model,
+                )
+                return result
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Gemini attempt %s/3 failed for model %s: %s",
+                    attempt + 1,
+                    model,
+                    type(exc).__name__,
+                )
+
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+
+        logger.warning(
+            "All retries failed for Gemini model %s",
             model,
         )
 
-        return result
+    logger.exception(
+        "Gemini code review failed after retries",
+        exc_info=last_error,
+    )
 
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        logger.exception("Gemini code review failed")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini review failed: {type(exc).__name__}",
-        ) from None
-
-
+    raise HTTPException(
+        status_code=502,
+        detail="Gemini review failed after retries; check server logs",
+    ) from None
 # -----------------------------
 # Health endpoint
 # -----------------------------
@@ -279,14 +313,26 @@ def review_github_pull_request(
 
     base_url = f"https://api.github.com/repos/{owner}/{repo}"
 
+    logger.info(
+        "Fetching changed files for %s/%s#%s at commit %s",
+        owner, repo, pull_number, head_sha,
+    )
     response = requests.get(
         f"{base_url}/pulls/{pull_number}/files",
         headers=headers,
         params={"per_page": 100},
         timeout=20,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        logger.error(
+            "GitHub could not list PR files (HTTP %s): %s",
+            response.status_code, response.text[:1000],
+        )
+        raise
     changed_files = response.json()
+    logger.info("GitHub returned %s changed files for PR #%s", len(changed_files), pull_number)
 
     findings = []
     reviewed_files = []
@@ -331,6 +377,7 @@ def review_github_pull_request(
             skipped_files.append(filename)
             continue
 
+        logger.info("Reviewing Python file %s for PR #%s", filename, pull_number)
         static_findings = run_bandit(code)
 
         result = review_with_gemini(
@@ -340,6 +387,10 @@ def review_github_pull_request(
         )
 
         reviewed_files.append(filename)
+        logger.info(
+            "AI analysis finished for %s (findings: %s)",
+            filename, len(result.findings),
+        )
         findings.extend(
             finding.model_dump()
             for finding in result.findings
@@ -396,8 +447,13 @@ def review_github_pull_request(
             "No AI findings were reported for the reviewed files."
         )
 
+    review_url = f"{base_url}/pulls/{pull_number}/reviews"
+    logger.info(
+        "Posting GitHub review for PR %s/%s#%s (files reviewed: %s)",
+        owner, repo, pull_number, len(reviewed_files),
+    )
     review_response = requests.post(
-        f"{base_url}/pulls/{pull_number}/reviews",
+        review_url,
         headers=headers,
         json={
             "commit_id": head_sha,
@@ -406,13 +462,36 @@ def review_github_pull_request(
         },
         timeout=20,
     )
-    review_response.raise_for_status()
+    try:
+        review_response.raise_for_status()
+    except requests.HTTPError:
+        logger.error(
+            "GitHub rejected the PR review (HTTP %s): %s",
+            review_response.status_code,
+            review_response.text[:2000],
+        )
+        raise
+
+    try:
+        review_data = review_response.json()
+    except ValueError:
+        logger.error(
+            "GitHub returned a non-JSON response after review submission (HTTP %s)",
+            review_response.status_code,
+        )
+        raise
+
+    review_id = review_data.get("id")
+    logger.info(
+        "GitHub review posted successfully for PR %s/%s#%s. Review ID: %s; URL: %s",
+        owner, repo, pull_number, review_id, review_data.get("html_url", "not provided"),
+    )
 
     return {
         "reviewed_files": reviewed_files,
         "skipped_files": skipped_files,
         "finding_count": len(findings),
-        "review_id": review_response.json().get("id"),
+        "review_id": review_id,
     }
 
 
@@ -534,6 +613,10 @@ async def github_webhook(
             detail="Pull request payload is missing required fields",
         )
 
+    logger.info(
+        "Accepted GitHub pull_request.%s for %s/%s#%s at commit %s",
+        action, owner, repo, pull_number, head_sha,
+    )
     background_tasks.add_task(
         run_pull_request_review_safely,
         owner,
